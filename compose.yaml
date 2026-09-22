@@ -1,0 +1,211 @@
+name: ${COMPOSE_PROJECT_NAME}
+
+services:
+  edge:
+    build:
+      context: ./config/edge
+      args:
+        EDGE_IMAGE: ${EDGE_IMAGE}
+    image: ${COMPOSE_PROJECT_NAME}-edge
+    restart: unless-stopped
+    environment:
+      GITLAB_HOST: ${GITLAB_HOST}
+      JENKINS_HOST: ${JENKINS_HOST}
+      SONAR_HOST: ${SONAR_HOST}
+      HTTPS_PORT: ${HTTPS_PORT}
+      NGINX_ENVSUBST_FILTER: '^(GITLAB_HOST|JENKINS_HOST|SONAR_HOST|HTTPS_PORT)$'
+    ports:
+      - ${BIND_ADDRESS}:${HTTPS_PORT}:${HTTPS_PORT}
+    volumes:
+      - ./config/edge/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ${DEVOPS_LAB_ROOT}/tls/server.crt:/run/tls/server.crt:ro
+      - ${DEVOPS_LAB_ROOT}/tls/server.key:/run/tls/server.key:ro
+    networks:
+      edge:
+        aliases:
+          - ${GITLAB_HOST}
+          - ${JENKINS_HOST}
+          - ${SONAR_HOST}
+    healthcheck:
+      test: [CMD-SHELL, "wget --no-check-certificate -q --spider --header='Host: ${JENKINS_HOST}' https://127.0.0.1:${HTTPS_PORT}/login"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      gitlab:
+        condition: service_started
+      jenkins:
+        condition: service_started
+      sonarqube:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: ${EDGE_MEMORY_LIMIT:-256m}
+
+  gitlab:
+    image: ${GITLAB_IMAGE}
+    restart: unless-stopped
+    shm_size: 256m
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url '${GITLAB_URL}'
+        gitlab_rails['nginx']['listen_port'] = 80
+        gitlab_rails['nginx']['listen_https'] = false
+        gitlab_rails['nginx']['proxy_set_headers'] = {
+          'Host' => '$$http_host',
+          'X-Real-IP' => '$$remote_addr',
+          'X-Forwarded-For' => '$$proxy_add_x_forwarded_for',
+          'X-Forwarded-Proto' => 'https',
+          'X-Forwarded-Ssl' => 'on'
+        }
+        gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT}
+        gitlab_rails['initial_root_password'] = File.read('/run/secrets/gitlab_root_password').strip
+        puma['worker_processes'] = 2
+        sidekiq['concurrency'] = 10
+        prometheus_monitoring['enable'] = false
+        prometheus['enable'] = false
+        alertmanager['enable'] = false
+        node_exporter['enable'] = false
+        postgres_exporter['enable'] = false
+        redis_exporter['enable'] = false
+        gitlab_exporter['enable'] = false
+        letsencrypt['enable'] = false
+    ports:
+      - ${BIND_ADDRESS}:${GITLAB_SSH_PORT}:22
+    entrypoint: [/bin/sh, -eu, -c]
+    command:
+      - |
+        install -m 0644 /run/lab-ca/ca.crt /etc/gitlab/trusted-certs/devops-lab.crt
+        exec /assets/init-container
+    secrets:
+      - gitlab_root_password
+    volumes:
+      - ${DEVOPS_LAB_ROOT}/data/gitlab/config:/etc/gitlab
+      - ${DEVOPS_LAB_ROOT}/data/gitlab/logs:/var/log/gitlab
+      - ${DEVOPS_LAB_ROOT}/data/gitlab/data:/var/opt/gitlab
+      - ${DEVOPS_LAB_ROOT}/tls/ca.crt:/run/lab-ca/ca.crt:ro
+    networks: [edge]
+    healthcheck:
+      test: [CMD, /opt/gitlab/bin/gitlab-healthcheck, --fail, --max-time, '10']
+      interval: 20s
+      timeout: 15s
+      retries: 30
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          memory: ${GITLAB_MEMORY_LIMIT:-8g}
+
+  jenkins:
+    build:
+      context: ./config/jenkins
+      args:
+        JENKINS_IMAGE: ${JENKINS_IMAGE}
+    image: ${COMPOSE_PROJECT_NAME}-jenkins
+    restart: unless-stopped
+    user: "${DEVOPS_LAB_UID}:${DEVOPS_LAB_GID}"
+    environment:
+      GITLAB_HOST: ${GITLAB_HOST}
+      JENKINS_HOST: ${JENKINS_HOST}
+      SONAR_HOST: ${SONAR_HOST}
+      JENKINS_URL: ${JENKINS_URL}
+      GITLAB_URL: ${GITLAB_URL}
+      SONAR_URL: ${SONAR_URL}
+      JAVA_OPTS: >-
+        -Djenkins.install.runSetupWizard=false
+        -Djavax.net.ssl.trustStore=/run/trust/devops-lab-cacerts.p12
+        -Djavax.net.ssl.trustStorePassword=changeit
+    volumes:
+      - ${DEVOPS_LAB_ROOT}/data/jenkins:/var/jenkins_home
+      - ${DEVOPS_LAB_ROOT}/secrets/jenkins:/run/jenkins-secrets:ro
+      - ${DEVOPS_LAB_ROOT}/config/jenkins/casc.d:/run/casc.d:ro
+      - ${DEVOPS_LAB_ROOT}/tls/trust/java-cacerts.p12:/run/trust/devops-lab-cacerts.p12:ro
+    networks: [edge]
+    healthcheck:
+      test: [CMD-SHELL, "curl --fail --silent --output /dev/null http://127.0.0.1:8080/login"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: ${JENKINS_MEMORY_LIMIT:-3g}
+
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sonar
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD_FILE: /run/secrets/sonar_db_password
+    secrets:
+      - sonar_db_password
+    volumes:
+      - ${DEVOPS_LAB_ROOT}/data/postgres:/var/lib/postgresql/data
+    networks: [sonar-db]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U sonar -d sonar]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEMORY_LIMIT:-2g}
+
+  sonarqube:
+    image: ${SONARQUBE_IMAGE}
+    restart: unless-stopped
+    user: "${DEVOPS_LAB_UID}:0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_WEB_JAVAADDITIONALOPTS: >-
+        -Djavax.net.ssl.trustStore=/run/trust/devops-lab-cacerts.p12
+        -Djavax.net.ssl.trustStorePassword=changeit
+      SONAR_CE_JAVAADDITIONALOPTS: >-
+        -Djavax.net.ssl.trustStore=/run/trust/devops-lab-cacerts.p12
+        -Djavax.net.ssl.trustStorePassword=changeit
+    entrypoint: [/bin/bash, -eu, -c]
+    command:
+      - |
+        export SONAR_JDBC_PASSWORD="$$(cat /run/secrets/sonar_db_password)"
+        exec /opt/sonarqube/docker/entrypoint.sh
+    secrets:
+      - sonar_db_password
+    volumes:
+      - ${DEVOPS_LAB_ROOT}/data/sonarqube/data:/opt/sonarqube/data
+      - ${DEVOPS_LAB_ROOT}/data/sonarqube/logs:/opt/sonarqube/logs
+      - ${DEVOPS_LAB_ROOT}/data/sonarqube/temp:/opt/sonarqube/temp
+      - ${DEVOPS_LAB_ROOT}/config/sonarqube/plugins:/opt/sonarqube/extensions/plugins
+      - ${DEVOPS_LAB_ROOT}/tls/trust/java-cacerts.p12:/run/trust/devops-lab-cacerts.p12:ro
+    networks: [edge, sonar-db]
+    healthcheck:
+      test: [CMD-SHELL, "curl --fail --silent http://127.0.0.1:9000/api/system/status | grep -q '\"status\":\"UP\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: ${SONARQUBE_MEMORY_LIMIT:-5g}
+
+secrets:
+  gitlab_root_password:
+    file: ${DEVOPS_LAB_ROOT}/secrets/gitlab_root_password
+  sonar_db_password:
+    file: ${DEVOPS_LAB_ROOT}/secrets/sonar_db_password
+
+networks:
+  edge:
+    name: ${COMPOSE_PROJECT_NAME}_edge
+  sonar-db:
+    name: ${COMPOSE_PROJECT_NAME}_sonar-db
+    internal: true

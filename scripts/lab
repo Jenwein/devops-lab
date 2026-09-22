@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+runtime_root="${DEVOPS_LAB_ROOT:-$HOME/devops-lab}"
+runtime_env="${runtime_root}/config/runtime.env"
+
+usage() {
+  echo "usage: scripts/lab setup|up|down|status|backup|restore|add-team|enable-gitlab-auth [options]" >&2
+}
+
+compose() {
+  # compose.py execs docker compose itself: versions.env and runtime.env must outrank
+  # whatever this shell exported, or a stale COMPOSE_PROJECT_NAME or DEVOPS_LAB_ROOT
+  # would point the command at another stack.
+  python3 "${repo_dir}/scripts/compose.py" --repo "${repo_dir}" --root "${runtime_root}" run -- "$@"
+}
+
+jenkins_image() {
+  python3 "${repo_dir}/scripts/compose.py" --repo "${repo_dir}" --root "${runtime_root}" image jenkins
+}
+
+setup() {
+  python3 "${repo_dir}/scripts/bootstrap.py" "$@"
+}
+
+ensure_setup() {
+  # Never bootstrap here: a missing runtime.env used to mean a fresh CA and fresh secrets,
+  # and an `up` against that empty root would recreate the running platform from nothing.
+  # `setup` is the only creator.
+  if [[ ! -f "${runtime_env}" ]]; then
+    echo "no runtime configuration at ${runtime_env}; run 'scripts/lab setup --root ${runtime_root}' or export DEVOPS_LAB_ROOT" >&2
+    exit 1
+  fi
+}
+
+ensure_java_truststore() {
+  local trust_dir="${runtime_root}/tls/trust"
+  local truststore="${trust_dir}/java-cacerts.p12"
+  if [[ -f "${truststore}" ]]; then
+    return
+  fi
+  mkdir -p "${trust_dir}"
+  chmod 0700 "${trust_dir}"
+  docker run --rm --user "$(id -u):$(id -g)" \
+    --mount "type=bind,src=${runtime_root}/tls/ca.crt,dst=/input/ca.crt,readonly" \
+    --mount "type=bind,src=${trust_dir},dst=/output" \
+    "$(jenkins_image)" \
+    sh -eu -c 'cp "$JAVA_HOME/lib/security/cacerts" /output/java-cacerts.p12
+      keytool -importcert -noprompt -alias devops-lab-ca -file /input/ca.crt \
+        -keystore /output/java-cacerts.p12 -storepass changeit >/dev/null'
+  chmod 0600 "${truststore}"
+}
+
+command="${1:-}"
+if [[ -z "${command}" ]]; then
+  usage
+  exit 2
+fi
+shift
+
+case "${command}" in
+  backup)
+    ensure_setup
+    python3 "${repo_dir}/scripts/backup.py" --repo "${repo_dir}" --root "${runtime_root}" "$@"
+    ;;
+  restore)
+    python3 "${repo_dir}/scripts/restore.py" --repo "${repo_dir}" "$@"
+    ;;
+  setup)
+    setup "$@"
+    ;;
+  up)
+    ensure_setup
+    ensure_java_truststore
+    wait_seconds="${DEVOPS_LAB_WAIT_SECONDS:-900}"
+    # No forced --build: Compose builds only an image that is missing, so images pinned by a
+    # restore survive, and `scripts/lab up --build` is the explicit way to rebuild.
+    compose up --detach --wait --wait-timeout "${wait_seconds}" "$@"
+    python3 "${repo_dir}/scripts/status.py" --repo "${repo_dir}" --root "${runtime_root}" --wait "${wait_seconds}"
+    python3 "${repo_dir}/scripts/platform_init.py" --repo "${repo_dir}" --root "${runtime_root}"
+    ;;
+  down)
+    ensure_setup
+    compose down "$@"
+    ;;
+  status)
+    ensure_setup
+    python3 "${repo_dir}/scripts/status.py" --repo "${repo_dir}" --root "${runtime_root}" "$@"
+    ;;
+  add-team)
+    ensure_setup
+    python3 "${repo_dir}/scripts/teams.py" --repo "${repo_dir}" --root "${runtime_root}" "$@"
+    ;;
+  enable-gitlab-auth)
+    ensure_setup
+    python3 "${repo_dir}/scripts/auth.py" --repo "${repo_dir}" --root "${runtime_root}" "$@"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

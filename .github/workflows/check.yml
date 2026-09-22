@@ -1,0 +1,48 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Unit tests (clean environment)
+        run: python3 -m unittest discover -s tests -p 'test*.py'
+      - name: Unit tests (conflicting ambient variables)
+        env:
+          DEVOPS_LAB_ROOT: /nonexistent/ambient
+          COMPOSE_PROJECT_NAME: ambient
+        run: python3 -m unittest discover -s tests -p 'test*.py'
+      - name: Compile
+        run: python3 -m compileall -q scripts examples tests
+      - name: Shell syntax and shellcheck
+        run: |
+          files="scripts/lab config/jenkins/jenkins-entrypoint.sh config/jenkins/validate-origin.sh examples/agents/linux/entrypoint.sh examples/quickstart/run.sh"
+          for f in $files; do bash -n "$f"; done
+          shellcheck $files
+      - name: Render the Compose file from a temporary runtime root
+        run: |
+          python3 scripts/bootstrap.py --root /tmp/ci-root --project ci --base-domain ci.test --https-port 8443 --ssh-port 2225
+          python3 scripts/compose.py --repo . --root /tmp/ci-root run -- config --format json > /tmp/rendered.json
+          python3 - <<'PY'
+          import json, pathlib, sys
+          sys.path.insert(0, "scripts")
+          import compose
+          rendered = json.load(open("/tmp/rendered.json"))["services"]
+          versions = compose.load_versions(pathlib.Path("."))
+          assert set(rendered) == set(compose.SERVICES), sorted(rendered)
+          for service in ("gitlab", "postgres", "sonarqube"):
+              assert rendered[service]["image"] == versions[service]["reference"], service
+          print("render ok:", sorted(rendered))
+          PY

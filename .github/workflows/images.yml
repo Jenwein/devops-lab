@@ -1,0 +1,24 @@
+name: images
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the Jenkins image with the frozen plugin set
+        run: |
+          image="$(python3 scripts/compose.py --repo . --root /tmp image jenkins)"
+          docker build --pull --build-arg "JENKINS_IMAGE=${image}" -t devops-lab-jenkins-ci config/jenkins
+      - name: Build the quickstart agent image
+        run: docker build --pull -t devops-lab-agent-ci examples/agents/linux

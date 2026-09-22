@@ -1,0 +1,11 @@
+# Default security realm. The entrypoint drops this file when an overlay in casc.d
+# defines a securityRealm of its own, because Configuration as Code merges the two
+# into one map and then refuses a realm with more than one entry.
+jenkins:
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          name: Platform Administrator
+          password: "${JENKINS_ADMIN_PASSWORD}"

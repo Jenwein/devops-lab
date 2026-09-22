@@ -1,0 +1,12 @@
+.superpowers/
+.venv/
+__pycache__/
+*.pyc
+.env
+.runtime/
+*.key
+*.p12
+*.pfx
+secrets/
+backups/
+evidence/private/

@@ -1,0 +1,24 @@
+# PLATFORM_PROJECT is the Compose project of the platform this agent joins. It cannot be
+# COMPOSE_PROJECT_NAME: this stack runs under a project of its own, and the -p that selects
+# it would rewrite COMPOSE_PROJECT_NAME for interpolation too.
+name: ${PLATFORM_PROJECT:?PLATFORM_PROJECT is required}-quickstart
+
+services:
+  agent:
+    build:
+      context: .
+    image: ${PLATFORM_PROJECT:?PLATFORM_PROJECT is required}-quickstart-agent
+    restart: unless-stopped
+    user: "${DEVOPS_LAB_UID}:${DEVOPS_LAB_GID}"
+    environment:
+      JENKINS_URL: ${JENKINS_URL}
+      AGENT_NAME: demo-linux
+    volumes:
+      - ${DEVOPS_LAB_ROOT}/tls/ca.crt:/run/tls/ca.crt:ro
+      - ${DEVOPS_LAB_ROOT}/secrets/quickstart_agent_secret:/run/agent/secret:ro
+    networks: [platform]
+
+networks:
+  platform:
+    name: ${PLATFORM_PROJECT:?PLATFORM_PROJECT is required}_edge
+    external: true

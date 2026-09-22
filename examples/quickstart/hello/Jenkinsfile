@@ -1,0 +1,28 @@
+pipeline {
+  agent { label 'demo-linux' }
+  options {
+    timeout(time: 15, unit: 'MINUTES')
+    disableConcurrentBuilds(abortPrevious: true)
+  }
+  stages {
+    stage('Test') {
+      steps {
+        sh 'python3 -m unittest discover -s . -p "test_*.py" -v'
+      }
+    }
+    stage('Analysis') {
+      steps {
+        withSonarQubeEnv(installationName: 'platform', credentialsId: 'sonar-demo') {
+          sh 'sonar-scanner -Dsonar.scm.revision="$GIT_COMMIT"'
+        }
+      }
+    }
+    stage('Quality gate') {
+      steps {
+        timeout(time: 5, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+  }
+}

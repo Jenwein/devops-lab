@@ -1,0 +1,49 @@
+jenkins:
+  systemMessage: "Shared DevOps platform controller. Teams own their folders, pipelines, credentials and agents."
+  numExecutors: 0
+  mode: EXCLUSIVE
+  disableRememberMe: true
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: admin
+            description: Platform administrators
+            permissions:
+              - Overall/Administer
+            entries:
+              - user: admin
+          - name: authenticated
+            description: Signed-in users may open the dashboard; team roles grant everything else
+            permissions:
+              - Overall/Read
+            entries:
+              - group: authenticated
+  remotingSecurity:
+    enabled: true
+  slaveAgentPort: -1
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: SYSTEM
+              id: gitlab-webhook-secret
+              description: Secret token GitLab sends with webhooks
+              secret: "${GITLAB_WEBHOOK_SECRET}"
+unclassified:
+  location:
+    adminAddress: "address not configured <nobody@invalid>"
+    url: "${JENKINS_URL}/"
+  gitLabServers:
+    servers:
+      - name: platform
+        serverUrl: "${GITLAB_URL}"
+        manageWebHooks: true
+        manageSystemHooks: false
+        webhookSecretCredentialsId: gitlab-webhook-secret
+  sonarGlobalConfiguration:
+    buildWrapperEnabled: true
+    installations:
+      - name: platform
+        serverUrl: "${SONAR_URL}"
