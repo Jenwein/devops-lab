@@ -50,6 +50,8 @@ assigned both Jenkins roles by name. SonarQube only knows a person once they
 have signed in, so a member who never has is reported as
 `sonar_members: alice=pending-first-login` and joins the SonarQube group on
 their first sign-in through GitLab; adding them again later also works.
+SonarQube gives a GitLab user a suffixed login such as `alice90205`;
+`add-team` finds them by their GitLab username either way.
 
 With [GitLab login](gitlab-login.md) enabled, GitLab group membership alone is
 enough: the group path is the Jenkins group and the SonarQube group, so the

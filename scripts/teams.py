@@ -293,20 +293,33 @@ def ensure_sonar_analysis_token(sonar, name: str, *, rotate: bool) -> tuple[str 
     return generated["token"], "rotated" if exists else "created"
 
 
-def ensure_sonar_member(sonar, group: str, login: str) -> str:
+def resolve_sonar_login(sonar, username: str) -> str | None:
+    """The SonarQube login for a username, or None if the person has never signed in.
+
+    A user who arrived through GitLab keeps the GitLab username as `externalIdentity`
+    but gets a suffixed login (alice -> alice90205), so match either field.
+    """
+    _, known, _ = sonar.request("GET", "/api/users/search?q=" + urllib.parse.quote(username))
+    for user in known.get("users", []):
+        if username in (user.get("login"), user.get("externalIdentity")):
+            return user["login"]
+    return None
+
+
+def ensure_sonar_member(sonar, group: str, username: str) -> str:
     """Put an existing SonarQube user in the team group.
 
     SonarQube only holds a user once they have logged in, so a member added before
     their first login cannot be placed in the group yet; GitLab group sync assigns
     it when they arrive. Adding an unknown login would fail with HTTP 404.
     """
+    login = resolve_sonar_login(sonar, username)
+    if login is None:
+        return "pending-first-login"
     _, payload, _ = sonar.request(
         "GET", "/api/user_groups/users?name=" + urllib.parse.quote(group) + "&selected=selected&q=" + urllib.parse.quote(login))
     if any(user.get("login") == login for user in payload.get("users", [])):
         return "kept"
-    _, known, _ = sonar.request("GET", "/api/users/search?q=" + urllib.parse.quote(login))
-    if not any(user.get("login") == login for user in known.get("users", [])):
-        return "pending-first-login"
     sonar.request("POST", "/api/user_groups/add_user", {"name": group, "login": login}, expected=(204,))
     return "added"
 

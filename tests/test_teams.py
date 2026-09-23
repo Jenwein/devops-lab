@@ -293,5 +293,25 @@ class SonarMemberTests(unittest.TestCase):
         self.assertEqual("pending-first-login", teams.ensure_sonar_member(sonar, "demo", "alice"))
         self.assertEqual([], sonar.posts())
 
+    def test_gitlab_user_is_found_by_external_identity_and_added_under_its_real_login(self) -> None:
+        """SonarQube suffixes the login of an externally authenticated user (alice -> alice90205)."""
+        sonar = FakeTransport({
+            ("GET", "/api/users/search"): (200, {"users": [
+                {"login": "alice90205", "externalProvider": "gitlab", "externalIdentity": "alice"}]}),
+            ("GET", "/api/user_groups/users"): (200, {"users": []}),
+            ("POST", "/api/user_groups/add_user"): (204, {}),
+        })
+        self.assertEqual("added", teams.ensure_sonar_member(sonar, "demo", "alice"))
+        self.assertEqual([("POST", "/api/user_groups/add_user", {"name": "demo", "login": "alice90205"})], sonar.posts())
+
+    def test_gitlab_user_already_in_the_group_is_kept_under_its_real_login(self) -> None:
+        sonar = FakeTransport({
+            ("GET", "/api/users/search"): (200, {"users": [
+                {"login": "alice90205", "externalProvider": "gitlab", "externalIdentity": "alice"}]}),
+            ("GET", "/api/user_groups/users"): (200, {"users": [{"login": "alice90205"}]}),
+        })
+        self.assertEqual("kept", teams.ensure_sonar_member(sonar, "demo", "alice"))
+        self.assertEqual([], sonar.posts())
+
 if __name__ == "__main__":
     unittest.main()
