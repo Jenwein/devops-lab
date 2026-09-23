@@ -48,6 +48,14 @@ item role over it and a node role over agents whose names start with the team
 name. The cost is that labels are shared: a team can target another team's
 agent by label unless the naming convention is respected.
 
+**Team roles are declared to Configuration as Code, not created through the
+Jenkins API.** Configuration as Code rebuilds the whole authorization strategy
+from its documents on every start, so roles added by API call disappeared at
+the first restart. `add-team` therefore writes the roles into an overlay under
+the runtime root and reloads the configuration. The cost is one more file that
+must always carry every team, because a sequence in an overlay replaces the
+sequence below it.
+
 **Module names avoid shadowing the standard library.** `scripts/` goes on
 `sys.path` when the scripts import each other, so the modules are called
 `transport.py` and `platform_init.py` rather than the obvious names. It reads

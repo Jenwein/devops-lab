@@ -1,5 +1,7 @@
+import json
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -28,10 +30,7 @@ def fresh_jenkins() -> FakeTransport:
     return FakeTransport({
         ("GET", "/job/demo/api/json"): [(404, {}), (200, {})],
         ("POST", "/createItem"): (200, {}),
-        ("GET", "/role-strategy/strategy/getRole"): (200, {}),
-        ("POST", "/role-strategy/strategy/addRole"): (200, {}),
-        ("POST", "/role-strategy/strategy/assignGroupRole"): (200, {}),
-        ("POST", "/role-strategy/strategy/assignUserRole"): (200, {}),
+        ("POST", "/configuration-as-code/reload"): (302, {}),
         ("GET", "/job/demo/credentials/store/folder/domain/_/credential/gitlab-demo/api/json"): (404, {}),
         ("GET", "/job/demo/credentials/store/folder/domain/_/credential/sonar-demo/api/json"): (404, {}),
         ("POST", "/job/demo/credentials/store/folder/domain/_/createCredentials"): (200, {}),
@@ -55,12 +54,26 @@ def fresh_sonar() -> FakeTransport:
     })
 
 
-def lab_with(gitlab, jenkins, sonar) -> mock.Mock:
+def temp_root(test: unittest.TestCase) -> pathlib.Path:
+    temporary = tempfile.TemporaryDirectory()
+    test.addCleanup(temporary.cleanup)
+    root = pathlib.Path(temporary.name)
+    (root / "config" / "jenkins" / "casc.d").mkdir(parents=True)
+    return root
+
+
+def lab_with(test: unittest.TestCase, gitlab, jenkins, sonar) -> mock.Mock:
     lab = mock.Mock()
+    lab.root = temp_root(test)
     lab.gitlab.return_value = gitlab
     lab.jenkins.return_value = jenkins
     lab.sonar.return_value = sonar
     return lab
+
+
+def overlay_roles(root: pathlib.Path) -> dict:
+    document = json.loads((root / "config" / "jenkins" / "casc.d" / teams.TEAMS_OVERLAY).read_text())
+    return document["jenkins"]["authorizationStrategy"]["roleBased"]["roles"]
 
 
 class ValidationTests(unittest.TestCase):
@@ -90,10 +103,63 @@ class XmlTests(unittest.TestCase):
         self.assertIn("<navigatorProjects/>", xml)
 
 
+class TeamRoleTests(unittest.TestCase):
+    """Team roles live in a Configuration as Code overlay, not in Jenkins' own config.
+
+    JCasC rebuilds the whole Role Strategy configuration from YAML on every start, so a
+    role added through the REST API vanished at the next restart. The overlay is the
+    only durable place for them.
+    """
+
+    def test_roles_use_casc_permission_names_and_bind_group_then_members(self) -> None:
+        roles = teams.team_roles("demo", ["bob", "alice"])
+        item, agent = roles["items"][0], roles["agents"][0]
+        self.assertEqual(("demo", "^demo(/.*)?$"), (item["name"], item["pattern"]))
+        self.assertEqual(("demo", "^demo-.*$"), (agent["name"], agent["pattern"]))
+        for permission in item["permissions"] + agent["permissions"]:
+            self.assertRegex(permission, r"^(Job|Run|SCM|Credentials|View|Agent)/[A-Za-z]+$", permission)
+        self.assertIn("Job/Build", item["permissions"])
+        self.assertIn("Credentials/View", item["permissions"])
+        self.assertIn("Agent/Connect", agent["permissions"])
+        self.assertNotIn("Agent/Create", agent["permissions"])
+        self.assertEqual([{"group": "demo"}, {"user": "alice"}, {"user": "bob"}], item["entries"])
+        self.assertEqual(item["entries"], agent["entries"])
+
+    def test_overlay_is_json_that_yaml_reads_and_merges_every_team(self) -> None:
+        root = temp_root(self)
+        path = teams.write_team_overlay(root, teams.team_roles("demo", []))
+        self.assertEqual(root / "config" / "jenkins" / "casc.d" / "20-teams.yaml", path)
+        self.assertEqual(0o600, path.stat().st_mode & 0o777)
+        self.assertEqual(["demo"], [r["name"] for r in overlay_roles(root)["items"]])
+        merged = teams.merge_team_roles(teams.read_team_overlay(root), teams.team_roles("payments", ["carol"]))
+        teams.write_team_overlay(root, merged)
+        roles = overlay_roles(root)
+        self.assertEqual(["demo", "payments"], [r["name"] for r in roles["items"]])
+        self.assertEqual(["demo", "payments"], [r["name"] for r in roles["agents"]])
+        self.assertNotIn("global", roles)
+
+    def test_merging_a_team_again_keeps_earlier_members_and_adds_new_ones(self) -> None:
+        first = teams.merge_team_roles({}, teams.team_roles("demo", ["alice"]))
+        second = teams.merge_team_roles(first, teams.team_roles("demo", ["bob"]))
+        self.assertEqual([{"group": "demo"}, {"user": "alice"}, {"user": "bob"}], second["items"][0]["entries"])
+        self.assertEqual(1, len(second["items"]))
+        self.assertEqual(second, teams.merge_team_roles(second, teams.team_roles("demo", [])))
+
+    def test_ensure_team_roles_reloads_only_when_the_overlay_changed(self) -> None:
+        root = temp_root(self)
+        jenkins = FakeTransport({("POST", "/configuration-as-code/reload"): (302, {})})
+        self.assertEqual("created", teams.ensure_team_roles(root, jenkins, "demo", []))
+        self.assertEqual("kept", teams.ensure_team_roles(root, jenkins, "demo", []))
+        self.assertEqual("updated", teams.ensure_team_roles(root, jenkins, "demo", ["alice"]))
+        self.assertEqual(2, sum(1 for _, p, _ in jenkins.posts() if p == "/configuration-as-code/reload"))
+        self.assertEqual([{"group": "demo"}, {"user": "alice"}], overlay_roles(root)["items"][0]["entries"])
+
+
 class AddTeamTests(unittest.TestCase):
     def test_fresh_team_creates_everything_and_binds_group_sids(self) -> None:
         gitlab, jenkins, sonar = fresh_gitlab(), fresh_jenkins(), fresh_sonar()
-        report = teams.add_team(lab_with(gitlab, jenkins, sonar), "demo", members=["alice"], today=TODAY)
+        lab = lab_with(self, gitlab, jenkins, sonar)
+        report = teams.add_team(lab, "demo", members=["alice"], today=TODAY)
 
         self.assertEqual("created", report["gitlab_group"])
         self.assertEqual("created", report["jenkins_folder"])
@@ -104,19 +170,16 @@ class AddTeamTests(unittest.TestCase):
         token_fields = next(f for m, p, f in gitlab.posts() if p == "/groups/7/access_tokens")
         self.assertEqual({"name": "jenkins", "scopes[]": ["api", "read_repository"], "access_level": 40,
                           "expires_at": "2027-09-21"}, token_fields)
-        roles = [f for m, p, f in jenkins.posts() if p == "/role-strategy/strategy/addRole"]
-        self.assertEqual({"projectRoles", "slaveRoles"}, {r["type"] for r in roles})
-        project = next(r for r in roles if r["type"] == "projectRoles")
-        self.assertEqual("^demo(/.*)?$", project["pattern"])
-        self.assertIn("hudson.model.Item.Build", project["permissionIds"].split(","))
-        self.assertIn("com.cloudbees.plugins.credentials.CredentialsProvider.View", project["permissionIds"].split(","))
-        node = next(r for r in roles if r["type"] == "slaveRoles")
-        self.assertEqual("^demo-.*$", node["pattern"])
-        groups = [f for m, p, f in jenkins.posts() if p == "/role-strategy/strategy/assignGroupRole"]
-        self.assertEqual([{"type": "projectRoles", "roleName": "demo", "group": "demo"},
-                          {"type": "slaveRoles", "roleName": "demo", "group": "demo"}], groups)
-        users = [f for m, p, f in jenkins.posts() if p == "/role-strategy/strategy/assignUserRole"]
-        self.assertEqual({"alice"}, {u["user"] for u in users})
+        self.assertEqual("created", report["jenkins_roles"])
+        roles = overlay_roles(lab.root)
+        self.assertEqual(["demo"], [role["name"] for role in roles["items"]])
+        self.assertEqual("^demo(/.*)?$", roles["items"][0]["pattern"])
+        self.assertEqual(list(teams.ITEM_PERMISSIONS), roles["items"][0]["permissions"])
+        self.assertEqual([{"group": "demo"}, {"user": "alice"}], roles["items"][0]["entries"])
+        self.assertEqual("^demo-.*$", roles["agents"][0]["pattern"])
+        self.assertEqual([{"group": "demo"}, {"user": "alice"}], roles["agents"][0]["entries"])
+        self.assertNotIn("role-strategy", " ".join(p for _, p, _ in jenkins.posts()))
+        self.assertEqual(1, sum(1 for _, p, _ in jenkins.posts() if p == "/configuration-as-code/reload"))
         created = [body for m, p, body in jenkins.posts() if p == "/job/demo/credentials/store/folder/domain/_/createCredentials"]
         self.assertEqual(2, len(created))
         self.assertIn("glgat-team-token-value", created[0])
@@ -136,15 +199,11 @@ class AddTeamTests(unittest.TestCase):
             ("GET", "/groups"): (200, [{"id": 7, "full_path": "demo"}]),
             ("GET", "/groups/7/access_tokens"): (200, [{"id": 1, "name": "jenkins", "active": True, "revoked": False}]),
         })
-        role = {"permissionIds": {p: True for p in teams.ITEM_PERMISSIONS}, "sids": ["demo"]}
-        node_role = {"permissionIds": {p: True for p in teams.NODE_PERMISSIONS}, "sids": ["demo"]}
         jenkins = FakeTransport({
             ("GET", "/job/demo/api/json"): (200, {}),
-            ("GET", "/role-strategy/strategy/getRole"): [(200, role), (200, node_role)],
             ("GET", "/job/demo/credentials/store/folder/domain/_/credential/gitlab-demo/api/json"): (200, {}),
             ("GET", "/job/demo/credentials/store/folder/domain/_/credential/sonar-demo/api/json"): (200, {}),
             ("GET", "/job/demo/job/gitlab/api/json"): (200, {}),
-            ("POST", "/role-strategy/strategy/assignGroupRole"): (200, {}),
         })
         sonar = FakeTransport({
             ("GET", "/api/user_groups/search"): (200, {"groups": [{"name": "demo"}]}),
@@ -152,11 +211,14 @@ class AddTeamTests(unittest.TestCase):
             ("POST", "/api/permissions/add_group_to_template"): (204, {}),
             ("GET", "/api/user_tokens/search"): (200, {"userTokens": [{"name": "jenkins-demo"}]}),
         })
-        report = teams.add_team(lab_with(gitlab, jenkins, sonar), "demo", today=TODAY)
+        lab = lab_with(self, gitlab, jenkins, sonar)
+        teams.write_team_overlay(lab.root, teams.team_roles("demo", []))
+        report = teams.add_team(lab, "demo", today=TODAY)
         self.assertEqual("kept", report["gitlab_token"])
         self.assertEqual("kept", report["sonar_token"])
+        self.assertEqual("kept", report["jenkins_roles"])
         self.assertEqual([], gitlab.posts())
-        self.assertEqual({"/role-strategy/strategy/assignGroupRole"}, {p for _, p, _ in jenkins.posts()})
+        self.assertEqual([], jenkins.posts())
         self.assertEqual({"/api/permissions/add_group_to_template"}, {p for _, p, _ in sonar.posts()})
 
     def test_missing_jenkins_credential_rotates_the_matching_token(self) -> None:
@@ -172,7 +234,7 @@ class AddTeamTests(unittest.TestCase):
         jenkins.responses[("GET", "/job/demo/job/gitlab/api/json")] = [(200, {})]
         sonar = fresh_sonar()
         sonar.responses[("GET", "/api/user_tokens/search")] = [(200, {"userTokens": [{"name": "jenkins-demo"}]})]
-        report = teams.add_team(lab_with(gitlab, jenkins, sonar), "demo", today=TODAY)
+        report = teams.add_team(lab_with(self, gitlab, jenkins, sonar), "demo", today=TODAY)
         self.assertEqual("rotated", report["gitlab_token"])
         self.assertEqual("kept", report["sonar_token"])
         self.assertIn(("DELETE", "/groups/7/access_tokens/1", None), gitlab.posts())
@@ -189,9 +251,7 @@ class AddTeamTests(unittest.TestCase):
         })
         jenkins = FakeTransport({
             ("GET", "/job/demo/api/json"): (200, {}),
-            ("GET", "/role-strategy/strategy/getRole"): (200, {"permissionIds": {}, "sids": []}),
-            ("POST", "/role-strategy/strategy/addRole"): (200, {}),
-            ("POST", "/role-strategy/strategy/assignGroupRole"): (200, {}),
+            ("POST", "/configuration-as-code/reload"): (302, {}),
             ("GET", "/job/demo/credentials/store/folder/domain/_/credential/gitlab-demo/api/json"): (200, {}),
             ("GET", "/job/demo/credentials/store/folder/domain/_/credential/sonar-demo/api/json"): (200, {}),
             ("POST", "/job/demo/credentials/store/folder/domain/_/credential/gitlab-demo/config.xml"): (200, {}),
@@ -201,7 +261,7 @@ class AddTeamTests(unittest.TestCase):
         sonar = fresh_sonar()
         sonar.responses[("GET", "/api/user_tokens/search")] = [(200, {"userTokens": [{"name": "jenkins-demo"}]})]
         sonar.responses[("POST", "/api/user_tokens/revoke")] = [(204, {})]
-        report = teams.add_team(lab_with(gitlab, jenkins, sonar), "demo", rotate_tokens=True, today=TODAY)
+        report = teams.add_team(lab_with(self, gitlab, jenkins, sonar), "demo", rotate_tokens=True, today=TODAY)
         self.assertEqual(("rotated", "rotated"), (report["gitlab_token"], report["sonar_token"]))
         updates = [p for m, p, _ in jenkins.posts() if p.endswith("/config.xml")]
         self.assertEqual(2, len(updates))

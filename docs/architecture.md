@@ -98,8 +98,12 @@ over `--env-file`, and an exported `DEVOPS_LAB_ROOT` or
 The controller uses Role Strategy. Two global roles ship with it: `admin`
 holds Overall/Administer and is assigned to the `admin` user, and
 `authenticated` holds Overall/Read, so a signed-in user sees the dashboard and
-nothing more until a team role grants it. `scripts/lab add-team` adds one item
-role and one node role for each team.
+nothing more until a team role grants it. `scripts/lab add-team` declares one
+item role and one node role for each team in the overlay
+`config/jenkins/casc.d/20-teams.yaml` under the runtime root and reloads the
+configuration; declaring them there rather than through the Jenkins API is
+what makes them survive a restart, because Configuration as Code rebuilds the
+authorization strategy from its documents every time Jenkins starts.
 
 The inbound TCP agent port is disabled, so agents connect over WebSocket
 through the HTTPS edge: one open port, one certificate, no second listener.

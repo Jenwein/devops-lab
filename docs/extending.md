@@ -65,6 +65,12 @@ jenkins:
 
 Overlays take effect on a restart, `scripts/lab down` then `scripts/lab up`.
 
+Two overlays are owned by the platform: `20-teams.yaml`, which `add-team`
+rewrites with every team's item and node roles, and `50-gitlab-auth.yaml`,
+written by `enable-gitlab-auth`. Do not edit them, and do not declare `items`
+or `agents` roles in an overlay of your own, because the sequence rule above
+would replace the teams' roles with yours.
+
 The security realm is a special case. The core document declares none:
 `config/jenkins/casc-local-realm.yaml`, which defines the local `admin`, is
 added to the sources only when no overlay declares a `securityRealm` of its

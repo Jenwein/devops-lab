@@ -28,6 +28,13 @@ carries build, configure, connect, delete and disconnect. The permission
 template gives the SonarQube group user, codeviewer, issueadmin,
 securityhotspotadmin, scan and admin on every project key it matches.
 
+The two Jenkins roles are declared in
+`$DEVOPS_LAB_ROOT/config/jenkins/casc.d/20-teams.yaml`, a Configuration as
+Code overlay listing every team's roles, and Jenkins reloads its configuration
+right away. Configuration as Code rebuilds the authorization strategy from its
+documents at every start, so this is what makes the roles survive restarts and
+restores. Do not edit the file by hand: the next `add-team` rewrites it.
+
 Every step prints one `step: outcome` line. For the objects above the outcome
 is `kept`, `created`, `updated` or `rotated`; the last two lines name the
 members and say what happened to each of them in SonarQube. The command is

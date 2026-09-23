@@ -72,7 +72,9 @@ Work through this list on the target server before handing the platform over.
 5. Create a GitLab user, then run `scripts/lab add-team demo --member <user>`
    and `scripts/lab enable-gitlab-auth`. Sign in to Jenkins and SonarQube with
    that user through GitLab and confirm it sees the team's folder and project
-   and nothing else.
+   and nothing else. Restart Jenkins (`scripts/lab down`, `scripts/lab up`)
+   and confirm the same user still sees the folder: team roles must survive
+   a restart.
 
 Then take a backup and rehearse a restore from it under a different identity:
 

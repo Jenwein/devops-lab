@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import pathlib
 import re
 import sys
@@ -12,6 +13,7 @@ import urllib.parse
 from xml.sax.saxutils import escape
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from bootstrap import atomic_write  # noqa: E402
 from compose import Lab  # noqa: E402
 
 TEAM_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
@@ -19,29 +21,24 @@ GITLAB_TOKEN_NAME = "jenkins"
 GITLAB_TOKEN_ACCESS_LEVEL = 40
 GITLAB_TOKEN_LIFETIME_DAYS = 365
 GITLAB_MEMBER_ACCESS_LEVEL = 30
+# Team roles are declared to Configuration as Code, so permissions use the JCasC
+# names. Configuration as Code rebuilds the whole Role Strategy configuration from
+# YAML on every Jenkins start; a role added through the REST API disappeared at the
+# next restart, which is why the overlay below is the only durable home for them.
+TEAMS_OVERLAY = "20-teams.yaml"
 ITEM_PERMISSIONS = (
-    "hudson.model.Item.Build", "hudson.model.Item.Cancel", "hudson.model.Item.Configure",
-    "hudson.model.Item.Create", "hudson.model.Item.Delete", "hudson.model.Item.Discover",
-    "hudson.model.Item.Move", "hudson.model.Item.Read", "hudson.model.Item.Workspace",
-    "hudson.model.Run.Delete", "hudson.model.Run.Replay", "hudson.model.Run.Update",
-    "hudson.scm.SCM.Tag",
-    "com.cloudbees.plugins.credentials.CredentialsProvider.Create",
-    "com.cloudbees.plugins.credentials.CredentialsProvider.Delete",
-    "com.cloudbees.plugins.credentials.CredentialsProvider.ManageDomains",
-    "com.cloudbees.plugins.credentials.CredentialsProvider.Update",
-    "com.cloudbees.plugins.credentials.CredentialsProvider.View",
-    "hudson.model.View.Configure", "hudson.model.View.Create", "hudson.model.View.Delete",
-    "hudson.model.View.Read",
+    "Job/Build", "Job/Cancel", "Job/Configure", "Job/Create", "Job/Delete", "Job/Discover",
+    "Job/Move", "Job/Read", "Job/Workspace",
+    "Run/Delete", "Run/Replay", "Run/Update",
+    "SCM/Tag",
+    "Credentials/Create", "Credentials/Delete", "Credentials/ManageDomains", "Credentials/Update",
+    "Credentials/View",
+    "View/Configure", "View/Create", "View/Delete", "View/Read",
 )
-# hudson.model.Computer.Create is deliberately omitted: Spike e showed the
-# Role Strategy plugin checks Agent/Create against Jenkins itself (there is
-# no node instance yet to match a node role's pattern against), so a node
-# role's pattern cannot gate creation by name. Node creation stays an
-# admin-only action.
-NODE_PERMISSIONS = (
-    "hudson.model.Computer.Build", "hudson.model.Computer.Configure", "hudson.model.Computer.Connect",
-    "hudson.model.Computer.Delete", "hudson.model.Computer.Disconnect",
-)
+# Agent/Create is deliberately omitted: the Role Strategy plugin checks it against
+# Jenkins itself (there is no node yet to match a node role's pattern against), so
+# a node role cannot gate creation by name. Node creation stays an admin action.
+NODE_PERMISSIONS = ("Agent/Build", "Agent/Configure", "Agent/Connect", "Agent/Delete", "Agent/Disconnect")
 SONAR_TEMPLATE_PERMISSIONS = ("user", "codeviewer", "issueadmin", "securityhotspotadmin", "scan", "admin")
 FOLDER_XML = '<com.cloudbees.hudson.plugins.folder.Folder plugin="cloudbees-folder"/>'
 CREDENTIAL_STORE = "/job/{folder}/credentials/store/folder/domain/_"
@@ -111,21 +108,66 @@ def ensure_folder(jenkins, name: str) -> str:
     return "created"
 
 
-def ensure_role(jenkins, role_type: str, name: str, pattern: str, permissions: tuple[str, ...]) -> str:
-    query = f"type={role_type}&roleName={urllib.parse.quote(name)}"
-    _, payload, _ = jenkins.request("GET", f"/role-strategy/strategy/getRole?{query}", expected=(200, 404))
-    current = payload.get("permissionIds") if isinstance(payload, dict) else None
-    if current is not None and set(current) == set(permissions) and payload.get("pattern", pattern) == pattern:
+def team_roles(name: str, members) -> dict:
+    """The team's item and node roles in JCasC form, bound to the team group and its members."""
+    entries = [{"group": name}] + [{"user": member} for member in sorted(set(members))]
+    return {
+        "items": [{"name": name, "pattern": f"^{name}(/.*)?$", "permissions": list(ITEM_PERMISSIONS), "entries": entries}],
+        "agents": [{"name": name, "pattern": f"^{name}-.*$", "permissions": list(NODE_PERMISSIONS), "entries": list(entries)}],
+    }
+
+
+def overlay_path(root: pathlib.Path) -> pathlib.Path:
+    return pathlib.Path(root) / "config" / "jenkins" / "casc.d" / TEAMS_OVERLAY
+
+
+def read_team_overlay(root: pathlib.Path) -> dict:
+    """The roles currently declared for teams: {"items": [...], "agents": [...]} or {}."""
+    path = overlay_path(root)
+    if not path.exists():
+        return {}
+    document = json.loads(path.read_text())
+    return document["jenkins"]["authorizationStrategy"]["roleBased"]["roles"]
+
+
+def write_team_overlay(root: pathlib.Path, roles: dict) -> pathlib.Path:
+    """Write the overlay as JSON, which YAML parses; the standard library has no YAML writer.
+
+    JCasC merges the overlay directory with the override strategy: mappings merge by
+    key, so `global` stays in the core file, while sequences are replaced whole, so
+    this file must always carry every team's roles.
+    """
+    document = {"jenkins": {"authorizationStrategy": {"roleBased": {"roles": {
+        "items": roles.get("items", []), "agents": roles.get("agents", [])}}}}}
+    path = overlay_path(root)
+    atomic_write(path, json.dumps(document, indent=2) + "\n", 0o600)
+    return path
+
+
+def merge_team_roles(existing: dict, team: dict) -> dict:
+    """Replace the team's roles, keeping earlier member entries and every other team."""
+    merged: dict = {}
+    for kind in ("items", "agents"):
+        new_role = team[kind][0]
+        old_role = next((r for r in existing.get(kind, []) if r["name"] == new_role["name"]), None)
+        if old_role is not None:
+            users = sorted({e["user"] for e in old_role["entries"] + new_role["entries"] if "user" in e})
+            new_role = dict(new_role, entries=[{"group": new_role["name"]}] + [{"user": u} for u in users])
+        others = [r for r in existing.get(kind, []) if r["name"] != new_role["name"]]
+        merged[kind] = sorted(others + [new_role], key=lambda r: r["name"])
+    return merged
+
+
+def ensure_team_roles(root: pathlib.Path, jenkins, name: str, members) -> str:
+    """Declare the team's roles in the overlay and make Jenkins reload it when it changed."""
+    existing = read_team_overlay(root)
+    merged = merge_team_roles(existing, team_roles(name, members))
+    if merged == {"items": existing.get("items", []), "agents": existing.get("agents", [])}:
         return "kept"
-    jenkins.request("POST", "/role-strategy/strategy/addRole",
-                    {"type": role_type, "roleName": name, "permissionIds": ",".join(permissions),
-                     "overwrite": "true", "pattern": pattern})
-    return "created" if current is None else "updated"
-
-
-def assign_role(jenkins, role_type: str, name: str, sid: str, kind: str) -> None:
-    endpoint = "assignGroupRole" if kind == "group" else "assignUserRole"
-    jenkins.request("POST", f"/role-strategy/strategy/{endpoint}", {"type": role_type, "roleName": name, kind: sid})
+    had_team = any(r["name"] == name for r in existing.get("items", []))
+    write_team_overlay(root, merged)
+    jenkins.request("POST", "/configuration-as-code/reload", expected=(200, 302))
+    return "updated" if had_team else "created"
 
 
 def credential_exists(jenkins, folder: str, credential_id: str) -> bool:
@@ -279,10 +321,7 @@ def add_team(lab: Lab, name: str, members=(), rotate_tokens: bool = False, today
 
     group, report["gitlab_group"] = ensure_group(gitlab, name)
     report["jenkins_folder"] = ensure_folder(jenkins, name)
-    report["jenkins_item_role"] = ensure_role(jenkins, "projectRoles", name, f"^{name}(/.*)?$", ITEM_PERMISSIONS)
-    report["jenkins_node_role"] = ensure_role(jenkins, "slaveRoles", name, f"^{name}-.*$", NODE_PERMISSIONS)
-    assign_role(jenkins, "projectRoles", name, name, "group")
-    assign_role(jenkins, "slaveRoles", name, name, "group")
+    report["jenkins_roles"] = ensure_team_roles(lab.root, jenkins, name, members)
 
     gitlab_credential = f"gitlab-{name}"
     token, report["gitlab_token"] = ensure_group_token(
@@ -305,8 +344,6 @@ def add_team(lab: Lab, name: str, members=(), rotate_tokens: bool = False, today
     for member in members:
         user = find_user(gitlab, member)
         ensure_group_member(gitlab, int(group["id"]), int(user["id"]))
-        assign_role(jenkins, "projectRoles", name, member, "user")
-        assign_role(jenkins, "slaveRoles", name, member, "user")
         sonar_members.append(f"{member}={ensure_sonar_member(sonar, name, member)}")
     report["members"] = ",".join(members) or "none"
     report["sonar_members"] = ",".join(sonar_members) or "none"
